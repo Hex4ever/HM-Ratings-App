@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 320" role="img" aria-label="Adrian Lewis profile illustration">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffe29f"/>
+      <stop offset="100%" stop-color="#ffa99f"/>
+    </linearGradient>
+    <linearGradient id="shirt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4a8fe7"/>
+      <stop offset="100%" stop-color="#2d5db3"/>
+    </linearGradient>
+  </defs>
+  <rect width="320" height="320" rx="36" fill="url(#bg)"/>
+  <circle cx="160" cy="124" r="68" fill="#f7c7a3"/>
+  <path d="M92 116c8-46 39-68 68-68s60 22 68 68c-31-12-39-42-39-42-22 28-61 31-97 42z" fill="#3f2d1f"/>
+  <circle cx="134" cy="124" r="6" fill="#2f2218"/>
+  <circle cx="186" cy="124" r="6" fill="#2f2218"/>
+  <path d="M139 153c9 10 32 10 41 0" fill="none" stroke="#9c4f38" stroke-linecap="round" stroke-width="5"/>
+  <path d="M76 276c16-50 49-78 84-78s68 28 84 78" fill="url(#shirt)"/>
+  <circle cx="160" cy="124" r="68" fill="none" stroke="#00000011" stroke-width="2"/>
+  <text x="160" y="304" text-anchor="middle" font-family="Verdana, sans-serif" font-size="26" font-weight="700" fill="#1f2a44">Adrian Lewis</text>
+</svg>
