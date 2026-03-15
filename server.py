@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import secrets
 import ssl
 import time
 import urllib.error
@@ -19,12 +18,14 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, request, send_from_directory
+from itsdangerous import BadSignature, URLSafeSerializer
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 INDEX_FILE = ROOT_DIR / "index.html"
 
 SESSION_COOKIE_NAME = "hm_session"
+SESSION_SIGNING_SALT = "hm-session-v1"
 DEFAULT_GOOGLE_TOKENINFO_URLS = [
     "https://oauth2.googleapis.com/tokeninfo",
     "https://www.googleapis.com/oauth2/v3/tokeninfo",
@@ -92,6 +93,7 @@ SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "43200"))  # 12 hours
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "0") == "1"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 HAPPINESS_MANAGER_EMAIL = normalize_email(os.getenv("HAPPINESS_MANAGER_EMAIL", ""))
+SESSION_SECRET = os.getenv("SESSION_SECRET", "").strip()
 TEAM_SIZE = int(os.getenv("TEAM_SIZE", "13"))
 GOOGLE_TOKENINFO_URLS = parse_url_list(os.getenv("GOOGLE_TOKENINFO_URLS", ""))
 if not GOOGLE_TOKENINFO_URLS:
@@ -100,7 +102,9 @@ if not GOOGLE_TOKENINFO_URLS:
 _raw_allowed = parse_email_list(os.getenv("ALLOWED_VOTER_EMAILS", ""))
 ALLOWED_VOTER_EMAILS = [email for email in _raw_allowed if email != HAPPINESS_MANAGER_EMAIL]
 
-SESSIONS: dict[str, dict[str, Any]] = {}
+SESSION_SERIALIZER = (
+    URLSafeSerializer(SESSION_SECRET, salt=SESSION_SIGNING_SALT) if SESSION_SECRET else None
+)
 
 
 def resolve_role(email: str) -> str:
@@ -189,38 +193,53 @@ def fetch_google_tokeninfo(id_token: str) -> dict[str, Any]:
     )
 
 
-def cleanup_sessions() -> None:
-    now = time.time()
-    expired = [sid for sid, data in SESSIONS.items() if data.get("expires_at", 0) <= now]
-    for sid in expired:
-        SESSIONS.pop(sid, None)
+def get_session_serializer() -> URLSafeSerializer:
+    if SESSION_SERIALIZER is None:
+        raise RuntimeError("SESSION_SECRET is not configured on server.")
+    return SESSION_SERIALIZER
 
 
-def create_session(email: str, role: str) -> str:
-    cleanup_sessions()
-    session_id = secrets.token_urlsafe(32)
-    SESSIONS[session_id] = {
+def create_session_token(email: str) -> str:
+    serializer = get_session_serializer()
+    payload = {
         "email": email,
-        "role": role,
-        "expires_at": time.time() + SESSION_TTL_SECONDS,
+        "exp": int(time.time()) + SESSION_TTL_SECONDS,
     }
-    return session_id
+    return serializer.dumps(payload)
 
 
-def get_session(session_id: str) -> dict[str, Any] | None:
-    cleanup_sessions()
-    data = SESSIONS.get(session_id)
-    if not data:
+def read_session_token(session_token: str) -> tuple[str, str] | None:
+    if not session_token:
         return None
-    if data.get("expires_at", 0) <= time.time():
-        SESSIONS.pop(session_id, None)
+
+    serializer = get_session_serializer()
+    try:
+        payload = serializer.loads(session_token)
+    except BadSignature:
         return None
-    return data
 
+    if not isinstance(payload, dict):
+        return None
 
-def clear_session(session_id: str) -> None:
-    if session_id:
-        SESSIONS.pop(session_id, None)
+    email = normalize_email(payload.get("email"))
+    exp_raw = payload.get("exp")
+
+    if not is_valid_email(email):
+        return None
+
+    try:
+        exp = int(exp_raw)
+    except (TypeError, ValueError):
+        return None
+
+    if exp <= int(time.time()):
+        return None
+
+    role = resolve_role(email)
+    if not role:
+        return None
+
+    return email, role
 
 
 def build_json_response(payload: dict[str, Any], status_code: int) -> Response:
@@ -231,17 +250,15 @@ def build_json_response(payload: dict[str, Any], status_code: int) -> Response:
 
 
 def get_authenticated_user() -> dict[str, Any] | None:
-    sid = request.cookies.get(SESSION_COOKIE_NAME, "")
-    if not sid:
+    session_token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not session_token:
         return None
-    data = get_session(sid)
-    if not data:
+
+    session_data = read_session_token(session_token)
+    if not session_data:
         return None
-    email = normalize_email(data.get("email"))
-    role = str(data.get("role", ""))
-    if role not in {"manager", "voter"} or not is_valid_email(email):
-        clear_session(sid)
-        return None
+
+    email, role = session_data
     return build_user_payload(email, role)
 
 
@@ -275,7 +292,11 @@ def auth_config() -> Response:
 
 @app.get("/auth/me")
 def auth_me() -> Response:
-    user = get_authenticated_user()
+    try:
+        user = get_authenticated_user()
+    except RuntimeError as exc:
+        return build_json_response({"error": str(exc)}, 503)
+
     if not user:
         return build_json_response({"error": "Not signed in."}, 401)
     return build_json_response({"user": user}, 200)
@@ -295,12 +316,16 @@ def auth_google() -> Response:
     except RuntimeError as exc:
         return build_json_response({"error": str(exc)}, 503)
 
-    session_id = create_session(email, role)
+    try:
+        session_token = create_session_token(email)
+    except RuntimeError as exc:
+        return build_json_response({"error": str(exc)}, 503)
+
     user = build_user_payload(email, role)
     response = build_json_response({"user": user}, 200)
     response.set_cookie(
         SESSION_COOKIE_NAME,
-        session_id,
+        session_token,
         max_age=SESSION_TTL_SECONDS,
         httponly=True,
         samesite="Lax",
@@ -312,8 +337,6 @@ def auth_google() -> Response:
 
 @app.post("/auth/logout")
 def auth_logout() -> Response:
-    sid = request.cookies.get(SESSION_COOKIE_NAME, "")
-    clear_session(sid)
     response = build_json_response({"ok": True}, 200)
     response.set_cookie(
         SESSION_COOKIE_NAME,
