@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Simple backend for secured Google auth and static page serving.
+"""Backend for secured Google auth and static page serving.
 
-This server keeps access-control data out of frontend source code.
+This file exports a Flask ``app`` entrypoint for Vercel Python deployments.
 """
 
 from __future__ import annotations
@@ -15,11 +15,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from http import HTTPStatus
-from http.cookies import SimpleCookie
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -30,6 +29,21 @@ DEFAULT_GOOGLE_TOKENINFO_URLS = [
     "https://oauth2.googleapis.com/tokeninfo",
     "https://www.googleapis.com/oauth2/v3/tokeninfo",
 ]
+ALLOWED_STATIC_EXTENSIONS = {
+    ".css",
+    ".gif",
+    ".html",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".js",
+    ".json",
+    ".map",
+    ".png",
+    ".svg",
+    ".txt",
+    ".webp",
+}
 
 
 def normalize_email(value: str | None) -> str:
@@ -143,10 +157,10 @@ def fetch_google_tokeninfo(id_token: str) -> dict[str, Any]:
     for base_url in GOOGLE_TOKENINFO_URLS:
         query = urllib.parse.urlencode({"id_token": id_token})
         url = f"{base_url}?{query}"
-        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        tokeninfo_request = urllib.request.Request(url, headers={"Accept": "application/json"})
 
         try:
-            with urllib.request.urlopen(request, timeout=12) as response:
+            with urllib.request.urlopen(tokeninfo_request, timeout=12) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code in {400, 401}:
@@ -209,189 +223,129 @@ def clear_session(session_id: str) -> None:
         SESSIONS.pop(session_id, None)
 
 
-def make_session_cookie(session_id: str) -> str:
-    parts = [
-        f"{SESSION_COOKIE_NAME}={session_id}",
-        "Path=/",
-        "HttpOnly",
-        "SameSite=Lax",
-        f"Max-Age={SESSION_TTL_SECONDS}",
-    ]
-    if COOKIE_SECURE:
-        parts.append("Secure")
-    return "; ".join(parts)
+def build_json_response(payload: dict[str, Any], status_code: int) -> Response:
+    response = jsonify(payload)
+    response.status_code = status_code
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
-def make_cleared_session_cookie() -> str:
-    parts = [
-        f"{SESSION_COOKIE_NAME}=",
-        "Path=/",
-        "HttpOnly",
-        "SameSite=Lax",
-        "Max-Age=0",
-    ]
-    if COOKIE_SECURE:
-        parts.append("Secure")
-    return "; ".join(parts)
-
-
-class AppHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, directory=str(ROOT_DIR), **kwargs)
-
-    def do_GET(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
-
-        if path == "/":
-            self._serve_index()
-            return
-        if path == "/auth/config":
-            self._send_json(
-                HTTPStatus.OK,
-                {
-                    "googleClientId": GOOGLE_CLIENT_ID,
-                    "teamSize": TEAM_SIZE,
-                },
-            )
-            return
-        if path == "/auth/me":
-            user = self._get_authenticated_user()
-            if not user:
-                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Not signed in."})
-                return
-            self._send_json(HTTPStatus.OK, {"user": user})
-            return
-        if path == "/health":
-            self._send_json(HTTPStatus.OK, {"ok": True})
-            return
-
-        super().do_GET()
-
-    def do_POST(self) -> None:
-        path = urllib.parse.urlparse(self.path).path
-
-        if path == "/auth/google":
-            self._handle_google_signin()
-            return
-        if path == "/auth/logout":
-            self._handle_logout()
-            return
-
-        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
-
-    def _handle_google_signin(self) -> None:
-        payload = self._read_json()
-        credential = str(payload.get("credential", "")).strip()
-        if not credential:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Missing Google credential."})
-            return
-
-        try:
-            email, role = verify_google_id_token(credential)
-        except PermissionError as exc:
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
-            return
-        except RuntimeError as exc:
-            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(exc)})
-            return
-
-        session_id = create_session(email, role)
-        user = build_user_payload(email, role)
-        self._send_json(
-            HTTPStatus.OK,
-            {"user": user},
-            extra_headers={"Set-Cookie": make_session_cookie(session_id)},
-        )
-
-    def _handle_logout(self) -> None:
-        sid = self._read_session_id()
+def get_authenticated_user() -> dict[str, Any] | None:
+    sid = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not sid:
+        return None
+    data = get_session(sid)
+    if not data:
+        return None
+    email = normalize_email(data.get("email"))
+    role = str(data.get("role", ""))
+    if role not in {"manager", "voter"} or not is_valid_email(email):
         clear_session(sid)
-        self._send_json(
-            HTTPStatus.OK,
-            {"ok": True},
-            extra_headers={"Set-Cookie": make_cleared_session_cookie()},
-        )
+        return None
+    return build_user_payload(email, role)
 
-    def _serve_index(self) -> None:
-        try:
-            content = INDEX_FILE.read_bytes()
-        except OSError:
-            self.send_error(HTTPStatus.NOT_FOUND, "index.html not found")
-            return
 
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(content)))
-        self.end_headers()
-        self.wfile.write(content)
+app = Flask(__name__, static_folder=None)
 
-    def _get_authenticated_user(self) -> dict[str, Any] | None:
-        sid = self._read_session_id()
-        if not sid:
-            return None
-        data = get_session(sid)
-        if not data:
-            return None
-        email = normalize_email(data.get("email"))
-        role = str(data.get("role", ""))
-        if role not in {"manager", "voter"} or not is_valid_email(email):
-            clear_session(sid)
-            return None
-        return build_user_payload(email, role)
 
-    def _read_session_id(self) -> str:
-        cookie_header = self.headers.get("Cookie", "")
-        if not cookie_header:
-            return ""
-        cookie = SimpleCookie()
-        try:
-            cookie.load(cookie_header)
-        except Exception:
-            return ""
-        morsel = cookie.get(SESSION_COOKIE_NAME)
-        return morsel.value if morsel else ""
+@app.get("/")
+def serve_index() -> Response:
+    if not INDEX_FILE.exists():
+        return build_json_response({"error": "index.html not found"}, 404)
+    response = send_from_directory(str(ROOT_DIR), "index.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
-    def _read_json(self) -> dict[str, Any]:
-        content_length = self.headers.get("Content-Length")
-        if not content_length:
-            return {}
-        try:
-            length = int(content_length)
-        except ValueError:
-            return {}
-        if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return {}
 
-    def _send_json(
-        self,
-        status: HTTPStatus,
-        payload: dict[str, Any],
-        extra_headers: dict[str, str] | None = None,
-    ) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        if extra_headers:
-            for key, value in extra_headers.items():
-                self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(body)
+@app.get("/health")
+def health() -> Response:
+    return build_json_response({"ok": True}, 200)
+
+
+@app.get("/auth/config")
+def auth_config() -> Response:
+    return build_json_response(
+        {
+            "googleClientId": GOOGLE_CLIENT_ID,
+            "teamSize": TEAM_SIZE,
+        },
+        200,
+    )
+
+
+@app.get("/auth/me")
+def auth_me() -> Response:
+    user = get_authenticated_user()
+    if not user:
+        return build_json_response({"error": "Not signed in."}, 401)
+    return build_json_response({"user": user}, 200)
+
+
+@app.post("/auth/google")
+def auth_google() -> Response:
+    payload = request.get_json(silent=True) or {}
+    credential = str(payload.get("credential", "")).strip()
+    if not credential:
+        return build_json_response({"error": "Missing Google credential."}, 400)
+
+    try:
+        email, role = verify_google_id_token(credential)
+    except PermissionError as exc:
+        return build_json_response({"error": str(exc)}, 403)
+    except RuntimeError as exc:
+        return build_json_response({"error": str(exc)}, 503)
+
+    session_id = create_session(email, role)
+    user = build_user_payload(email, role)
+    response = build_json_response({"user": user}, 200)
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        session_id,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="Lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
+    return response
+
+
+@app.post("/auth/logout")
+def auth_logout() -> Response:
+    sid = request.cookies.get(SESSION_COOKIE_NAME, "")
+    clear_session(sid)
+    response = build_json_response({"ok": True}, 200)
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        "",
+        max_age=0,
+        httponly=True,
+        samesite="Lax",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
+    return response
+
+
+@app.get("/<path:asset_path>")
+def serve_asset(asset_path: str) -> Response:
+    filename = Path(asset_path).name
+    suffix = Path(asset_path).suffix.lower()
+    if filename.startswith(".") or suffix not in ALLOWED_STATIC_EXTENSIONS:
+        return build_json_response({"error": "Not found."}, 404)
+
+    full_path = (ROOT_DIR / asset_path).resolve()
+    if ROOT_DIR not in full_path.parents and full_path != ROOT_DIR:
+        return build_json_response({"error": "Not found."}, 404)
+    if not full_path.is_file():
+        return build_json_response({"error": "Not found."}, 404)
+    return send_from_directory(str(ROOT_DIR), asset_path)
 
 
 def main() -> None:
-    host = os.getenv("HOST", "localhost")
+    host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "8000"))
-    server = ThreadingHTTPServer((host, port), AppHandler)
-    print(f"Serving on http://{host}:{port}")
-    server.serve_forever()
+    app.run(host=host, port=port)
 
 
 if __name__ == "__main__":
